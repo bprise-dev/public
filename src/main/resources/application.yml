@@ -1,0 +1,31 @@
+#spring:
+#  data:
+#   cassandra:
+#      password: a5UCzxRYqOoUm7sewDKC5v50J53MTDgExb
+#      username: utrack
+#      keyspace-name: ad_delivery_data_migration
+#      contact-points: 139.59.67.97
+#      
+ # redis:
+ #   password: WrQB2Hdlk9rvpJ99W8
+ #   host: 139.59.56.86
+ #   port: 6379
+ #   timeout: 30000
+ #   database: 0
+ #   emqttAuthDatabase: 9
+    
+spring:
+  data:
+    cassandra:
+      password: cassandra
+      username: cassandra
+      keyspace-name: ad_delivery_data_migration
+      contact-points: 192.168.55.221
+      
+  redis:
+    password: bprise
+    host: 192.168.55.249
+    port: 6379
+    timeout: 30000
+    database: 3
+    emqttAuthDatabase: 9

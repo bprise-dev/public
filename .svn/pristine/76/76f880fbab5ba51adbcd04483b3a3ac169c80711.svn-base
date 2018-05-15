@@ -1,0 +1,346 @@
+package com.bprise.orbit.migration.handler;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import org.apache.commons.validator.GenericValidator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import com.bprise.orbit.migration.util.Constants;
+import com.bprise.orbit.migration.util.QueryStore;
+import com.datastax.driver.core.BoundStatement;
+import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
+import com.datastax.driver.core.UDTValue;
+
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.Pipeline;
+
+/**
+ * LocationHandler Program implements updated ads record detail from cassandra
+ * to Redis.
+ * 
+ * @author vishal.shelar
+ *
+ */
+@Component
+public class AudienceHandler implements Handler {
+
+	public final Logger logger = LoggerFactory.getLogger(AudienceHandler.class);
+
+	/**
+	 * This api take the updated ad id's from cassandra and update the ad details
+	 * for Redis
+	 * <p>
+	 * It first deletes all updated id's and then create the new keys with respect
+	 * to updated id's.
+	 * 
+	 * @param ids
+	 * @param session
+	 * @param jedis
+	 */
+	public void update(List<Long> ids, Session session, Jedis jedis) {
+
+		/************* FETCHING THE DATA FROM CASSANDRA *********************/
+		PreparedStatement prepared = session.prepare(QueryStore.GET_AUDIENCE);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+
+		/***************
+		 * CREATING A PIPLINE FOR BATCH INSERTION IN REDIS
+		 ***************/
+		Pipeline dataPipeline = jedis.pipelined();
+
+		/***************
+		 * CREATING A PIPLINE FOR BATCH DELETEION IN REDIS
+		 ***************/
+		Pipeline deleteDataPipeline = jedis.pipelined();
+
+		for (int i = 0; i <= rows.size(); i += Constants.AUDIENCE_KEY_CRATION_BATCH_SIZE) {
+
+			try {
+				/**************************
+				 * DELETEING THE SELECTED AUDIENCE KEYS
+				 *****************************************/
+				/************************
+				 * CREATING THE SUBLIST FOR BATCH DELETION & INSERTION
+				 ****************/
+				/****************
+				 * START - DELETING THE PREVIOUS ENTRIES FOR SAME AUDIENCE RULE ID
+				 ********************/
+				deleteAudienceDetails(rows.subList(i, i + Constants.AUDIENCE_KEY_CRATION_BATCH_SIZE), jedis,
+						deleteDataPipeline);
+				/****************
+				 * END - DELETING THE PREVIOUS ENTRIES FOR SAME AUDIENCE RULE ID
+				 ********************/
+				/**************************
+				 * INSERTING AUDIENCE KEYS
+				 *****************************************/
+				/*****************
+				 * START - MAKING THE NEW ENTRIES OF AUDIENCE RULE IDs
+				 **********************************/
+				setAudienceDetails(rows.subList(i, i + Constants.AUDIENCE_KEY_CRATION_BATCH_SIZE), jedis, dataPipeline);
+				/*****************
+				 * END - MAKING THE NEW ENTRIES OF AUDIENCE RULE IDs
+				 **********************************/
+				logger.info("INSETRING RESULTSET FROM " + i + " TO " + (i + Constants.AUDIENCE_KEY_CRATION_BATCH_SIZE));
+			} catch (IndexOutOfBoundsException e) {
+				/*****
+				 * FOR THE LAST SUBLIST IF THE DATA IS SHORT FOR THE THRESHOLD OF BATCH THEN IT
+				 * WILL GET CAUGHT IN THIS EXCEPTION
+				 ****/
+				logger.info("INSTRING LAST BATCH FROM " + i + " TO " + rows.size());
+				deleteAudienceDetails(rows.subList(i, rows.size()), jedis, deleteDataPipeline);
+				setAudienceDetails(rows.subList(i, rows.size()), jedis, dataPipeline);
+			}
+		} // for loop ends
+
+	}
+
+	private void deleteAudienceDetails(List<Row> rowList, Jedis jedis, Pipeline deleteDataPipeline) {
+		// TODO Auto-generated method stub
+		/***********************
+		 * ITERATING THE RESULT SET LIST
+		 **************************************/
+		Long audienceRuleId;
+		Set<String> listOfKeys = new HashSet<>();
+		for (Row row : rowList) {
+			audienceRuleId = row.getLong(Constants.DB_COLUMN_NAME_AUD_RULE_ID);
+			listOfKeys = jedis.smembers(Constants.AUDIENCE_KEY_PREFIX+audienceRuleId.toString());
+			deleteSetOfKeys(listOfKeys, deleteDataPipeline, audienceRuleId);
+			listOfKeys.clear();
+		} // end rowList iterator
+		/***********************
+		 * END - ITERATING THE RESULT SET LIST
+		 **************************************/
+	}
+
+	private void deleteSetOfKeys(Set<String> listOfKeys, Pipeline deleteDataPipeline, Long audienceRuleId) {
+		// TODO Auto-generated method stub
+		String minAgeValue = "";
+		String maxAgeValue = "";
+		int minAge = 0;
+		int maxAge = 0;
+		for (String key : listOfKeys) {
+			if (key.startsWith(Constants.GENDER_KEY_PREFIX.toString())) {
+				deleteDataPipeline.srem(key, Constants.AUDIENCE_KEY_PREFIX+audienceRuleId.toString());
+				deleteDataPipeline.srem(Constants.AUDIENCE_KEY_PREFIX+audienceRuleId.toString(), key);
+			} else if (key.startsWith(Constants.AGE_KEY_PREFIX.toString())) {
+				minAgeValue = getMatchingResult(key, Constants.REGEX_TO_GET_MIN_AGE);
+				maxAgeValue = getMatchingResult(key, Constants.REGEX_TO_GET_MAX_AGE);
+
+				if (!(GenericValidator.isBlankOrNull(minAgeValue)) && !(GenericValidator.isBlankOrNull(maxAgeValue))) {
+
+					try {
+						minAge = Integer.parseInt(minAgeValue);
+						maxAge = Integer.parseInt(maxAgeValue);
+					} catch (NumberFormatException e) {
+						logger.error("Error occurs while parsing an age ....");
+						minAge = 0;
+						maxAge = 0;
+					}
+					for (int i = minAge; i <= maxAge; i++)
+						deleteDataPipeline.srem(Constants.AGE_KEY_PREFIX.toString() + "_" + i,
+								Constants.AUDIENCE_KEY_PREFIX+audienceRuleId.toString());
+					deleteDataPipeline.srem(Constants.AUDIENCE_KEY_PREFIX+audienceRuleId.toString(), key);
+
+				} else
+					logger.error(key + " is giving false Age values....");
+
+			}
+
+		} // ends iterating list of keys
+			
+
+		deleteDataPipeline.sync();
+	}
+
+	private void setAudienceDetails(List<Row> rowList, Jedis jedis, Pipeline dataPipeline) {
+		for (Row row : rowList) {
+			Long audienceRuleId = row.getLong(Constants.DB_COLUMN_NAME_AUD_RULE_ID);
+			Map<Long, UDTValue> audienceMap = row.getMap(Constants.DB_COLUMN_NAME_AUD_RULE_DETAILS, Long.class,
+					UDTValue.class);
+
+			if (!(audienceMap.isEmpty())) {
+				int minAge = 0;
+				int maxAge = 0;
+				String gender = "";
+				String minAgeString = "";
+				String maxAgeString = "";
+				for (Long key : audienceMap.keySet()) {
+
+					UDTValue udtValue = audienceMap.get(key);
+					/*****************************
+					 * CHECKING THE UDT STATUS IS INCLUDE OR NOT
+					 *******************************************************/
+					/****************************
+					 * WE ARE ONLY CONSIDERING INCLUDE KEYS
+					 *************************************************************/
+					if (udtValue.getString(Constants.UDT_AUD_STAUS_ATTRIBUTE)
+							.equalsIgnoreCase(Constants.INCLUDE_VALUE)) {
+
+						switch (udtValue.getString(Constants.UDT_ATT_NAME_ATTRIBUTE)) {
+						case Constants.MIN_AGE_VALUE:
+							minAgeString = udtValue.getString(Constants.UDT_AUD_ATT_VALUE_ATTRIBUTE).trim();
+							try {
+								minAge = Integer.parseInt(minAgeString);
+							} catch (NumberFormatException e) {
+								minAge=0;
+								logger.error("exception occurs while converting age min value into integer considering"
+										+ " default value of minimum age value =0 instead of "
+										+ udtValue.getString(Constants.UDT_AUD_ATT_VALUE_ATTRIBUTE).trim());
+								continue;
+								
+							}
+							break;
+						case Constants.MAX_AGE_VALUE:
+							maxAgeString = udtValue.getString(Constants.UDT_AUD_ATT_VALUE_ATTRIBUTE).trim();
+							
+							
+							try {
+								maxAge = Integer.parseInt(maxAgeString);
+							} catch (NumberFormatException e) {
+								
+								if(maxAgeString.equalsIgnoreCase(Constants.SIXTY_FIVE_PLUS))
+									maxAge=	65;
+								else {
+									maxAge=	0;
+									logger.error("exception occurs while converting age min value into integer considering"
+											+ " default value of max age value =0 instead of "
+											+ udtValue.getString(Constants.UDT_AUD_ATT_VALUE_ATTRIBUTE).trim());
+									continue;
+								}
+								
+							
+							}
+							break;
+						case Constants.GENDER_VALUE:
+							gender = Constants.GENDER_KEY_PREFIX+getMatchingResult(udtValue.getString(Constants.UDT_AUD_ATT_VALUE_ATTRIBUTE)
+									,Constants.REGEX_FOR_GETTING_GENDER_PREFIX);
+							break;
+						default:
+							logger.info(udtValue.getString(Constants.UDT_ATT_NAME_ATTRIBUTE) + " Attribute is missing");
+							break;
+						}// end switch case
+					} // ends if checking status include or not
+					else {
+						logger.error("Audience Rule attribute Id "
+								+ audienceMap.get(key).getLong(Constants.UDT_AUD_RULE_SET_ATT_ID_ATTRIBUTE)
+								+ " is having staus Exclude...");
+					} // ends else checking status include or not
+
+					/**********************
+					 * CHECKING IF MIN & MAX ATTRIBUTE IS BLANK OR NULL THEN ONLY WE WILL CRETAE AGE
+					 * KEYS
+					 *****************************/
+					if (!(GenericValidator.isBlankOrNull(minAgeString))
+							&& !(GenericValidator.isBlankOrNull(maxAgeString))) {
+						/*****************
+						 * ITERATING MIN_AGE TO MAX AGE TO GENERATE KEYS FOR EACH AGE
+						 ***************/
+						for (int i = minAge; i <= maxAge; i++) {
+							if(!(GenericValidator.isBlankOrNull(Constants.AGE_KEY_PREFIX + "_" + i))
+									&&(!GenericValidator.isBlankOrNull(audienceRuleId.toString())))
+							dataPipeline.sadd(Constants.AGE_KEY_PREFIX + "_" + i, Constants.AUDIENCE_KEY_PREFIX+audienceRuleId.toString());
+						}
+						/*********************
+						 * END ITERATION
+						 ********************************************************/
+						if(!(GenericValidator.isBlankOrNull(audienceRuleId.toString()))&& 
+								!(GenericValidator.isBlankOrNull(Constants.AGE_KEY_PREFIX.toString() + minAge + "_" + maxAge)))
+						dataPipeline.sadd(Constants.AUDIENCE_KEY_PREFIX+audienceRuleId.toString(),
+								(Constants.AGE_KEY_PREFIX.toString() + minAge + "_" + maxAge));
+					} /***********************
+						 * END CHECKING MAX AGE CONDITION
+						 ***********************************/
+
+					/******************
+					 * INSTARING GENDER KEY INTO PIPELINE
+					 ****************************/
+					if(!(GenericValidator.isBlankOrNull(gender)) &&
+							!(GenericValidator.isBlankOrNull(audienceRuleId.toString())))
+					dataPipeline.sadd(gender, Constants.AUDIENCE_KEY_PREFIX+audienceRuleId.toString());
+
+					/************************
+					 * GENDER VALUE KEY FORMATION FOR THE REFERENCE TO DELETE IT AGAIN
+					 *****************************/
+					if(!(GenericValidator.isBlankOrNull(gender)) &&
+							!(GenericValidator.isBlankOrNull(audienceRuleId.toString())))
+					dataPipeline.sadd(Constants.AUDIENCE_KEY_PREFIX+audienceRuleId.toString(), gender);
+
+				} // end hash map for loop
+			} // ends if audience info is available or not
+			else {
+				logger.info("Audience rule id " + row.getLong(Constants.DB_COLUMN_NAME_AUD_RULE_ID)
+						+ " is don't have audience Details...");
+			} // ends else audience info is available or not
+		} // ends Row iterator
+		dataPipeline.sync();
+	}
+
+	private static String getMatchingResult(String key, String regexPattern) {
+		// TODO Auto-generated method stub
+		Pattern pattern = Pattern.compile(regexPattern);
+		Matcher matcher = pattern.matcher(key);
+		String matchedResponse = "";
+		while (matcher.find())
+			matchedResponse = matcher.group();
+
+		return matchedResponse;
+	}
+
+	/*
+	 * private void setAudienceDetails(Row row, Jedis jedis) { Map<Long, UDTValue>
+	 * audienceMap = row.getMap("aud_rules", Long.class, UDTValue.class); if
+	 * (!audienceMap.isEmpty()) { for (Map.Entry<Long, UDTValue> entryset :
+	 * audienceMap.entrySet()) { Map<String, String> audienceDetails = new
+	 * HashMap<String, String>(); audienceDetails.put("status",
+	 * entryset.getValue().getString("status"));
+	 * audienceDetails.put(entryset.getValue().getString("attribute_name"),
+	 * entryset.getValue().getString("attribute_value")); jedis.hmset("rule_attr_" +
+	 * entryset.getValue().getLong("audience_rule_set_attribute_id"),
+	 * audienceDetails); jedis.sadd( Constants.AUD_REDIS_KEY +
+	 * row.getLong(Constants.AUDIENCE_RULE_CASSANDRA_ID) + ":" + "rule_" +
+	 * row.getLong("audience_rule_set_id"), "rule_attr_" +
+	 * entryset.getValue().getLong("audience_rule_set_attribute_id")); } }
+	 * 
+	 * 
+	 * }
+	 */
+
+	/*
+	 * private void setAudienceDetails(Row row, Jedis jedis) { Map<Long, UDTValue>
+	 * audienceMap = row.getMap("aud_rules", Long.class, UDTValue.class);
+	 * Map<String,List<String>> audienceMapping = new
+	 * HashMap<String,List<String>>(); List<String> values = new
+	 * ArrayList<String>(); if (!audienceMap.isEmpty()) { for (Map.Entry<Long,
+	 * UDTValue> entryset : audienceMap.entrySet()) {
+	 * 
+	 * Map<String, String> audienceDetails = new HashMap<String, String>();
+	 * 
+	 * values.add(entryset.getValue().getString("attribute_value"));
+	 * audienceMapping.put(entryset.getValue().getString("attribute_name")+"_"+
+	 * entryset.getValue().getString("status"),values);
+	 * audienceDetails.put("status", entryset.getValue().getString("status"));
+	 * audienceDetails.put(entryset.getValue().getString("attribute_name"),
+	 * entryset.getValue().getString("attribute_value")); jedis.hmset("rule_attr_" +
+	 * entryset.getValue().getLong("audience_rule_set_attribute_id"),
+	 * audienceDetails); jedis.sadd( Constants.AUD_REDIS_KEY +
+	 * row.getLong(Constants.AUDIENCE_RULE_CASSANDRA_ID) + ":" + "rule_" +
+	 * row.getLong("audience_rule_set_id"), "rule_attr_" +
+	 * entryset.getValue().getLong("audience_rule_set_attribute_id")); } }
+	 * 
+	 * 
+	 * }
+	 */
+
+}

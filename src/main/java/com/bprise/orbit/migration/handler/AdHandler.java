@@ -1,0 +1,131 @@
+package com.bprise.orbit.migration.handler;
+
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import com.bprise.orbit.migration.util.Constants;
+import com.bprise.orbit.migration.util.QueryStore;
+import com.datastax.driver.core.BoundStatement;
+import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
+import com.datastax.driver.core.UDTValue;
+
+import redis.clients.jedis.Jedis;
+
+/**
+ * AdHandler Program implements updated ads record detail from cassandra to
+ * Redis.
+ * 
+ * @author vishal.shelar
+ *
+ */
+@Component
+public class AdHandler implements Handler {
+	
+	
+	/**
+	 * This api take the updated ad id's from cassandra and update the ad
+	 * details for Redis
+	 * <p>
+	 * It first deletes all updated id's and then create the new keys with
+	 * respect to updated id's.
+	 * 
+	 * @param ids
+	 * @param session
+	 * @param jedis
+	 */
+	
+	private static final Logger LOGGER = LoggerFactory.getLogger(AdHandler.class);
+	public void update(List<Long> ids, Session session, Jedis jedis) {
+		ids.forEach(p -> {
+			jedis.keys(Constants.AD_REDIS_KEY + p + "*").forEach(t -> {
+				jedis.del(t);
+				jedis.srem("Image", t);
+			});
+			;
+		});
+		PreparedStatement prepared = session.prepare(QueryStore.GET_ADS);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			setAdDetails(row, jedis);
+		}
+	}
+
+	private void setAdDetails(Row row, Jedis jedis) {
+		Map<String, String> adDetails = new HashMap<String,String>();
+		Map<Long, UDTValue> templatesMap = row.getMap("templates", Long.class, UDTValue.class);
+		if (!templatesMap.entrySet().isEmpty()) {
+			for (Map.Entry<Long, UDTValue> entryset : templatesMap.entrySet()) {
+				if (entryset.getKey() != 0) {
+					entryset.getValue().getString("ad_template");
+					jedis.sadd(row.getString("type"), "ad_" + row.getLong("ad_id") + ":t_" + entryset.getKey() + ":"
+							+ entryset.getValue().getString("resolution").replaceAll(" ", ""));
+					jedis.set(
+							"ad_" + row.getLong("ad_id") + ":t_" + entryset.getKey() + ":"
+									+ entryset.getValue().getString("resolution").replaceAll(" ", ""),
+							entryset.getValue().getString("ad_template"));
+				}
+			}
+		}else{
+			jedis.sadd(row.getString("type"), "ad_" + row.getLong("ad_id"));
+		}
+		Map<Long, UDTValue> imagesMap = row.getMap("images", Long.class, UDTValue.class);
+		if(!imagesMap.entrySet().isEmpty()){
+			for (Map.Entry<Long, UDTValue> entryset : imagesMap.entrySet()) {
+				if (entryset.getKey() != 0) {
+				adDetails.put("image_url", entryset.getValue().getString("image_url"));
+				}
+			}
+		}
+		adDetails.put("title", row.getString("title"));
+		adDetails.put("message", row.getString("message"));
+		adDetails.put("callback_action", row.getString("callback_action"));
+		adDetails.put("name", row.getString("name"));
+		adDetails.put("targeturl", null == row.getString("url")?"":row.getString("url"));
+		adDetails.put("adtype", row.getString("type"));
+		adDetails.put("deep_linking", null == row.getString("deep_linking")?"":row.getString("deep_linking"));
+		
+		Long seconds = 0l;
+		if("DAY".equalsIgnoreCase(row.getString("frequency_unit"))){
+			seconds = row.getLong("frequency_limit") * 86400;
+		}else if("HOUR".equalsIgnoreCase(row.getString("frequency_unit"))){
+			seconds = row.getLong("frequency_limit") * 3600;
+		}
+		
+		adDetails.put("frequency_limit", String.valueOf(seconds));
+		
+		Map<Long, UDTValue> videoMap = row.getMap("videos", Long.class, UDTValue.class);
+		if(!videoMap.entrySet().isEmpty()){
+			for (Map.Entry<Long, UDTValue> entryset : videoMap.entrySet()) {
+				if (entryset.getKey() != 0) {
+				adDetails.put("video_url",entryset.getValue().getString("video_url"));
+				adDetails.put("video_size",(null == String.valueOf(entryset.getValue().getDouble("video_size")))?"":String.valueOf(entryset.getValue().getDouble("video_size")));
+				adDetails.put("video_width",String.valueOf(entryset.getValue().getInt("video_width")));
+				adDetails.put("video_height",String.valueOf(entryset.getValue().getInt("video_height")));
+				adDetails.put("video_type",entryset.getValue().getString("video_type"));
+				adDetails.put("bitrate",String.valueOf(entryset.getValue().getDouble("bitrate")));
+				DateTimeFormatter f = DateTimeFormatter.ofPattern("HH:mm:ss") ;
+				LocalTime t = LocalTime.MIN.plusSeconds(Long.valueOf(entryset.getValue().getLong("duration")));
+				adDetails.put("duration",t.format(f));
+				adDetails.put("video_image_url",null == entryset.getValue().getString("video_image_url")?"":entryset.getValue().getString("video_image_url"));
+				adDetails.put("final_url",entryset.getValue().getString("final_url"));
+				}
+			}
+		}
+		LOGGER.debug("ad id "+row.getLong("ad_id") +" and  ad details"+adDetails);
+		jedis.sadd(row.getString("medium_name").replaceAll(" ", "").toLowerCase()+"_ads","ad_" + row.getLong("ad_id"));
+		jedis.hmset("ad_" + row.getLong("ad_id"), adDetails);
+	}
+	
+}

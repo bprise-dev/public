@@ -1,0 +1,187 @@
+package com.bprise.orbit.migration.handler;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import com.bprise.orbit.migration.util.Constants;
+import com.bprise.orbit.migration.util.QueryStore;
+import com.datastax.driver.core.BoundStatement;
+import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
+
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.Pipeline;
+
+/**
+ * LocationHandler Program implements updated ads record detail from cassandra
+ * to Redis.
+ * 
+ * @author vishal.shelar
+ *
+ */
+@Component
+public class CampaignHandler implements Handler {
+
+	public static final Logger logger= LoggerFactory.getLogger(CampaignHandler.class);
+	/**
+	 * This api take the updated ad id's from cassandra and update the ad
+	 * details for Redis
+	 * <p>
+	 * It first deletes all updated id's and then create the new keys with
+	 * respect to updated id's.
+	 * 
+	 * @param ids
+	 * @param session
+	 * @param jedis
+	 */
+	
+	public void update(List<Long> ids, Session session, Jedis jedis) {
+		
+		ids.forEach(p -> {
+			jedis.keys(Constants.CAMPAIGN_REDIS_KEY + p + "*").forEach(t -> {
+				jedis.del(t);
+			});
+			;
+		});
+		
+		/************************** START - CREATING KEYS OF THOSE CAMPAIGNS WHO DON'T HAVE ANY AUDIENCE MAPPED ************/
+		
+		PreparedStatement preparedForCampaignAudienceIdMapping = session.prepare(QueryStore.GET_DATA_CAMPAIGN_AUDIENCE_ID_MAPPED);
+		BoundStatement boundForCampaignAudienceIdMapping = preparedForCampaignAudienceIdMapping.bind(ids);
+		ResultSet rsForCampaignAudienceIdMapping = session.execute(boundForCampaignAudienceIdMapping);
+		List<Row> rowsForCampaignAudienceIdMapping = rsForCampaignAudienceIdMapping.all();
+		
+		List<Long> tempCampaignId= new ArrayList<>(ids);
+		Set<Long> campaignIdHavingAudience= new HashSet<>();
+		if(rowsForCampaignAudienceIdMapping.isEmpty()||rowsForCampaignAudienceIdMapping.size()==0)
+			logger.info("Campagin Ids doesn't have Ids doesn't have any audience key mapped....");
+		else {
+			logger.info("STARTED CREATING KEY FOR NO AUDIENCE CAMPAIGN...");
+			rowsForCampaignAudienceIdMapping.forEach(data->campaignIdHavingAudience.add(data.getLong(Constants.CAMPAIGN_CASSANDRA_ID)));
+			
+			/**************** REMOVING CAMPAIGN IDS WHO IS HAVING AUDIENCE MAPPED *******************/
+			
+			deleteCampaignIdsHavingAudience(campaignIdHavingAudience,jedis);
+			
+			Set<Long> campaignIdsWithNoAudience=getMissingIdsFromAudience(tempCampaignId,campaignIdHavingAudience);
+			
+			/******************** INSERTING THOSE CAMPAIGN IDS WHO DON'T HAVE ANY AUDIENCE MAPPED ***************/
+			
+			insertNoAudienceCampaignIds(campaignIdsWithNoAudience,jedis);
+			
+		}// ends else condition
+		
+		/************************** END - CREATING KEYS OF THOSE CAMPAIGNS WHO DON'T HAVE ANY AUDIENCE MAPPED ************/
+		
+		PreparedStatement prepared = session.prepare(QueryStore.GET_CAMPAIGNS);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			setCampaignDetails(row, jedis,session);
+		}
+		campaignLocationMapping(ids, session, jedis);
+		campaignAudienceMapping(ids, session, jedis);
+		campaignAdMapping(ids, session, jedis);
+	}
+
+	private void deleteCampaignIdsHavingAudience(Set<Long> campaignIdHavingAudience, Jedis jedis) {
+		// TODO Auto-generated method stub
+		logger.info(campaignIdHavingAudience.size()+" NUMBER OF CAMPAIGN IS HAVING AUDIENCE MAPPED....");
+		Pipeline pipelined = jedis.pipelined();
+		campaignIdHavingAudience.forEach(data->pipelined.srem(Constants.NO_AUDIENCE_CAMPAIGN_IDS_KEY,
+				data.toString().trim()));
+		pipelined.sync();
+	}
+
+	private void insertNoAudienceCampaignIds(Set<Long> campaignIdsWithNoAudience, Jedis jedis) {
+		// TODO Auto-generated method stub
+		logger.info(campaignIdsWithNoAudience.size()+" NUMBER OF CAMPAIGN IS HAVING NO AUDIENCE MAPPED....");
+		Pipeline pipelined = jedis.pipelined();
+		
+		campaignIdsWithNoAudience.forEach(data->pipelined.sadd(Constants.NO_AUDIENCE_CAMPAIGN_IDS_KEY,
+				data.toString().trim()));
+		
+		pipelined.sync();
+	}
+
+	private Set<Long> getMissingIdsFromAudience(List<Long> tempCampaignId, Set<Long> campaignIdHavingAudience) {
+		// TODO Auto-generated method stub
+		/******************* REMOVING ALL COMMON RECORDS *******************************************/
+		/**
+		 * Common records indicates those campaign ids are having audience in it. so we are removing those records as 
+		 * we want those campign ids who don't have any audience map.
+		 */
+		tempCampaignId.removeAll(campaignIdHavingAudience);
+		Set<Long>campaignIdsWithNoAudience= new HashSet<>(tempCampaignId);
+		return campaignIdsWithNoAudience;
+	}
+
+	private void setCampaignDetails(Row row, Jedis jedis,Session session) {
+		Map<String, String> campaingDetails = new HashMap<String, String>();
+		campaingDetails.put("currency_id", String.valueOf(row.getLong("currency_id")));
+		campaingDetails.put("name", row.getString("name"));
+		campaingDetails.put("vendorId", String.valueOf(row.getLong("vendor_id")));
+		jedis.hmset(Constants.CAMPAIGN_REDIS_KEY + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID), campaingDetails);
+	}
+
+	private void campaignLocationMapping(List<Long> ids, Session session, Jedis jedis) {
+		PreparedStatement prepared = null;
+		prepared = session.prepare(QueryStore.CAMPAIGN_LOCATION_MAP_QUERY);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			if (row.getByte("is_deleted") == 0) {
+				jedis.set("map_loc_" + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID), "camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID));
+			} else {
+				jedis.del("map_loc_" + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID));
+			}
+		}
+	}
+
+	private void campaignAudienceMapping(List<Long> ids, Session session, Jedis jedis) {
+		PreparedStatement prepared = null;
+		prepared = session.prepare(QueryStore.CAMPAIGN_AUDIENCE_MAP_QUERY);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			if (row.getByte("is_deleted") == 0) {
+				jedis.set("camp_" +row.getLong(Constants.CAMPAIGN_CASSANDRA_ID)+":aud" , "aud_" + row.getLong("audience_id"));
+			} else {
+				jedis.del("camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID)+":aud");
+			}
+		}
+	}
+	
+
+	private void campaignAdMapping(List<Long> ids, Session session, Jedis jedis) {
+		PreparedStatement prepared = null;
+		prepared = session.prepare(QueryStore.CAMPAIGN_AD_MAP_QUERY);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			if (row.getByte("is_deleted") == 0) {
+				jedis.set("map_ad_" + row.getLong("ad_id"), "camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID));
+				jedis.sadd("map_camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID), "ad_"+row.getLong("ad_id"));
+			} else {
+				jedis.del("map_ad_" + row.getLong("ad_id"));
+				jedis.srem("map_camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID), "ad_"+row.getLong("ad_id"));
+			}
+		}
+		
+	}
+
+}

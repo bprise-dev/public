@@ -1,0 +1,59 @@
+package com.bprise.orbit.migration.handler;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.stereotype.Component;
+
+import com.bprise.orbit.migration.util.QueryStore;
+import com.datastax.driver.core.BoundStatement;
+import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
+
+import redis.clients.jedis.Jedis;
+
+@Component
+public class VendorApplicationHandler implements Handler {
+
+	@Override
+	public void update(List<Long> ids, Session session, Jedis jedis) {
+		ids.forEach(p -> {
+			jedis.keys("vendorapp_" + p + "*").forEach(t -> {
+				jedis.del(t);
+			});
+			;
+		});
+		PreparedStatement prepared = session.prepare(QueryStore.GET_VENDOR_APPLICATION);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			createVendorApplication(row, jedis);
+		}
+	}
+
+	private void createVendorApplication(Row row, Jedis jedis) {
+		if (row.getByte("is_deleted") == 0) {
+			Map<String, String> vendorAppDetails = new HashMap<String, String>();
+			vendorAppDetails.put("api_key", row.getString("api_key")!= null?row.getString("api_key"):"");
+			vendorAppDetails.put("application_id", row.getString("application_id")!=null? row.getString("application_id"):"");
+			vendorAppDetails.put("name", row.getString("name")!= null?row.getString("name"):"");
+			vendorAppDetails.put("os_name", row.getString("os_name")!= null?row.getString("os_name"):"");
+			vendorAppDetails.put("package_name", row.getString("package_name")!= null?row.getString("package_name"):"");
+			vendorAppDetails.put("vendorId", String.valueOf(row.getLong("vendor_id")));
+			vendorAppDetails.put("appType", row.getString("app_type"));
+			vendorAppDetails.put("isSelfApp", String.valueOf(row.getByte("is_self_app")));
+			jedis.hmset("vendorapp_" + row.getLong("id"), vendorAppDetails);
+			jedis.set("vendorappuid_"+row.getString("vendor_application_uid"),  String.valueOf(row.getLong("id")));
+			jedis.set("map_vendor_"+row.getLong("vendor_id")+":"+"vendorapp_"+row.getLong("id"), "");
+		} else {
+			jedis.del("vendorapp_" + row.getLong("id"));
+			jedis.del("map_vendor_"+row.getLong("vendor_id")+":"+"vendorapp_"+row.getLong("id"));
+			jedis.del("vendorappuid_"+row.getString("vendor_application_uid"));
+		}
+	}
+
+}

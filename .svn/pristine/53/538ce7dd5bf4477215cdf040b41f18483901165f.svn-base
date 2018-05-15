@@ -1,0 +1,133 @@
+package com.bprise.orbit.migration.handler;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.stereotype.Component;
+
+import com.bprise.orbit.migration.util.Constants;
+import com.bprise.orbit.migration.util.QueryStore;
+import com.datastax.driver.core.BoundStatement;
+import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
+
+import redis.clients.jedis.Jedis;
+
+/**
+ * LocationHandler Program implements updated ads record detail from cassandra
+ * to Redis.
+ * 
+ * @author vishal.shelar
+ *
+ */
+@Component
+public class CampaignHandler implements Handler {
+
+	/**
+	 * This api take the updated ad id's from cassandra and update the ad
+	 * details for Redis
+	 * <p>
+	 * It first deletes all updated id's and then create the new keys with
+	 * respect to updated id's.
+	 * 
+	 * @param ids
+	 * @param session
+	 * @param jedis
+	 */
+	
+	public void update(List<Long> ids, Session session, Jedis jedis) {
+		ids.forEach(p -> {
+			jedis.keys(Constants.CAMPAIGN_REDIS_KEY + p + "*").forEach(t -> {
+				jedis.del(t);
+			});
+			;
+		});
+		PreparedStatement prepared = session.prepare(QueryStore.GET_CAMPAIGNS);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			setCampaignDetails(row, jedis,session);
+		}
+		campaignLocationMapping(ids, session, jedis);
+		campaignAudienceMapping(ids, session, jedis);
+		campaignAdMapping(ids, session, jedis);
+	}
+
+	private void setCampaignDetails(Row row, Jedis jedis,Session session) {
+		Map<String, String> campaingDetails = new HashMap<String, String>();
+//		campaingDetails.put("budget_limit", String.valueOf(row.getLong("budget_limit")));
+//		campaingDetails.put("budget_unit", row.getString("budget_unit") == null? "": row.getString("budget_unit"));
+		campaingDetails.put("currency_id", String.valueOf(row.getLong("currency_id")));
+//		campaingDetails.put("priority", String.valueOf(row.getLong("priority")));
+		campaingDetails.put("name", row.getString("name"));
+		campaingDetails.put("vendorId", String.valueOf(row.getLong("vendor_id")));
+		jedis.hmset(Constants.CAMPAIGN_REDIS_KEY + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID), campaingDetails);
+		/*PreparedStatement prepared = session.prepare(QueryStore.GET_VENDORS);
+		BoundStatement bound = prepared.bind(String.valueOf(row.getLong("vendor_id")));
+		ResultSet rs = session.execute(bound);
+		Row vendorRow = rs.one();
+		Map<String, String> budgetDetails = new HashMap<String, String>();
+		budgetDetails.put("is_daily_campaign", String.valueOf(row.getByte("is_daily_campaign")));
+		budgetDetails.put("revenue_type", row.getString("revenue_type"));
+		if (row.getString("revenue_type").equalsIgnoreCase("CPM")) {
+			budgetDetails.put("revenue_unit", String.valueOf(vendorRow.getDouble("cpm_rate")));
+		}
+		if (row.getString("revenue_type").equalsIgnoreCase("CPC")) {
+			budgetDetails.put("revenue_unit", String.valueOf(vendorRow.getDouble("cpc_rate")));
+		}
+		budgetDetails.put("commission", String.valueOf(vendorRow.getDouble("commission")));
+		jedis.hmset("budget_camp_"+ row.getLong(Constants.CAMPAIGN_CASSANDRA_ID),budgetDetails);*/
+	}
+
+	private void campaignLocationMapping(List<Long> ids, Session session, Jedis jedis) {
+		PreparedStatement prepared = null;
+		prepared = session.prepare(QueryStore.CAMPAIGN_LOCATION_MAP_QUERY);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			if (row.getByte("is_deleted") == 0) {
+				jedis.set("map_loc_" + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) +":"+"camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID), "");
+			} else {
+				jedis.del("map_loc_" + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) +":"+"camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID));
+			}
+		}
+	}
+
+	private void campaignAudienceMapping(List<Long> ids, Session session, Jedis jedis) {
+		PreparedStatement prepared = null;
+		prepared = session.prepare(QueryStore.CAMPAIGN_AUDIENCE_MAP_QUERY);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			if (row.getByte("is_deleted") == 0) {
+				jedis.set("map_aud_" + row.getLong("audience_id") +":"+"camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID), "");
+			} else {
+				jedis.del("map_aud_" + row.getLong("audience_id") + ":"+"camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID));
+			}
+		}
+	}
+	
+
+	private void campaignAdMapping(List<Long> ids, Session session, Jedis jedis) {
+		PreparedStatement prepared = null;
+		prepared = session.prepare(QueryStore.CAMPAIGN_AD_MAP_QUERY);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			if (row.getByte("is_deleted") == 0) {
+				jedis.set("map_ad_" + row.getLong("ad_id") +":"+"camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID), "");
+			} else {
+				jedis.del("map_ad_" + row.getLong("ad_id") + ":"+"camp_" + row.getLong(Constants.CAMPAIGN_CASSANDRA_ID));
+			}
+		}
+		
+	}
+
+}

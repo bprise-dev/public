@@ -1,0 +1,412 @@
+package com.bprise.orbit.migration.handler;
+
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import com.bprise.orbit.migration.util.Constants;
+import com.bprise.orbit.migration.util.QueryStore;
+import com.datastax.driver.core.BoundStatement;
+import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
+import com.datastax.driver.core.UDTValue;
+
+import redis.clients.jedis.GeoCoordinate;
+import redis.clients.jedis.Jedis;
+
+/**
+ * LocationHandler Program implements updated ads record detail from cassandra
+ * to Redis.
+ * 
+ * @author vishal.shelar
+ *
+ */
+@Component
+public class LocationHandler implements Handler {
+
+	/**
+	 * This api take the updated ad id's from cassandra and update the ad
+	 * details for Redis
+	 * <p>
+	 * It first deletes all updated id's and then create the new keys with
+	 * respect to updated id's.
+	 * 
+	 * @param ids
+	 * @param session
+	 * @param jedis
+	 */
+	private static final Logger LOGGER = LoggerFactory.getLogger(LocationHandler.class);
+
+	public void update(List<Long> ids, Session session, Jedis jedis) {
+		deleteLocationkeys(ids, jedis);
+		PreparedStatement prepared = session.prepare(QueryStore.GET_LOCATIONS);
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		for (Row row : rows) {
+			createLocationGroup(row, jedis);
+		}
+	}
+
+	private void deleteLocationkeys(List<Long> ids, Jedis jedis) {
+		Iterator<Long> iterator = ids.iterator();
+		while (iterator.hasNext()) {
+			Long locationId = iterator.next();
+			Map<String, String> tempLocationDetails = jedis
+					.hgetAll(String.valueOf(Constants.TEMP_LOCATION_REDIS_KEYS + locationId));
+			for (Map.Entry<String, String> entrySet : tempLocationDetails.entrySet()) {
+				jedis.srem(entrySet.getValue(), Constants.LOCATION_REDIS_KEYS + locationId);
+			}
+			jedis.keys(Constants.LOCATION_REDIS_KEYS + locationId + "*").forEach(t -> {
+				jedis.del(t);
+			});
+		}
+	}
+
+	private void createLocationGroup(Row row, Jedis jedis) {
+		setLocationDetails(row, jedis);
+		switch (row.getString("location_group_type")) {
+		case "GEO_LOCATION":
+			setCountryDetails(row, jedis);
+			setCityAndStateDetails(row, jedis);
+			break;
+		case "LOCATION_WITH_SUBLOCATION":
+			setPlaceDetails(row, jedis);
+			break;
+		default:
+			break;
+		}
+	}
+
+	private void setLocationDetails(Row row, Jedis jedis) {
+		Map<String, String> locationDetails = new HashMap<String, String>();
+		locationDetails.put("loc_group_type", row.getString("location_group_type"));
+		if (null != row.getString("time_operator")) {
+			switch (row.getString("time_operator")) {
+			case "DWELL_TIME":
+				locationDetails.put("dwell_time", String.valueOf(row.getInt("time_interval")));
+				locationDetails.put("post_time", "");
+				break;
+			case "POST_VISIT":
+				locationDetails.put("post_time", String.valueOf(row.getInt("time_interval")));
+				locationDetails.put("dwell_time", "");
+				break;
+
+			default:
+				locationDetails.put("dwell_time", "");
+				locationDetails.put("post_time", "");
+				break;
+			}
+		}
+		// locationDetails.put("dwell_time_oper",
+		// row.getString("location_dwell_time_operator"));
+
+		locationDetails.put("is_journey_rule_set", String.valueOf(row.getByte("is_journey_rule_set")));
+		int seconds = 0;
+		if ("DAYS".equalsIgnoreCase(row.getString("journey_expiry_time_unit"))) {
+			seconds = row.getInt("journey_expiry_time") * 86400;
+		} else if ("HOURS".equalsIgnoreCase(row.getString("journey_expiry_time_unit"))) {
+			seconds = row.getInt("journey_expiry_time") * 3600;
+		} else if ("MINUTES".equalsIgnoreCase(row.getString("journey_expiry_time_unit"))) {
+			seconds = row.getInt("journey_expiry_time") * 60;
+		}
+		locationDetails.put("journey_expiry_time", String.valueOf(seconds));
+		row.getSet("custom_section_udt", UDTValue.class).stream().forEach(p -> {
+			if (p != null) {
+				/*
+				 * jedis.set(Constants.LOCATION_REDIS_KEYS +
+				 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" +
+				 * "sec_" + p.getString("section_name").replaceAll(" ",
+				 * "").toLowerCase(), "");
+				 */
+				jedis.sadd("sec_" + p.getString("section_name").replaceAll(" ", "").toLowerCase() + ":loc",
+						Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID));
+				jedis.hset(Constants.TEMP_LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID),
+						"SECTION_NAME", "sec_" + p.getString("section_name").replaceAll(" ", "").toLowerCase());
+			}
+		});
+		if (String.valueOf(row.getByte("is_journey_rule_set")).equals("1")) {
+			setJourneyDetails(row, jedis);
+		}
+		LOGGER.debug("location group id is " + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID)
+				+ " for Location details -> " + locationDetails);
+		jedis.hmset(Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID),
+				locationDetails);
+	}
+
+	private void setJourneyDetails(Row row, Jedis jedis) {
+		List<UDTValue> journeyList = row.getList("journey_info", UDTValue.class);
+		journeyList.stream().forEach(p -> {
+			if (p.getString("journey_rule_status").equalsIgnoreCase("Include")) {
+				Map<String, String> journeyDetails = new HashMap<String, String>();
+				journeyDetails.put("journey_dwell_time_oper", p.getString("journey_rule_dwell_time_operator"));
+				journeyDetails.put("journey_dwell_time", String.valueOf(p.getLong("journey_rule_dwell_time")));
+				journeyDetails.put("journey_rule_status", p.getString("journey_rule_status"));
+				p.getSet("journey_section_udt", UDTValue.class).forEach(jounenySection -> {
+					jedis.hmset(
+							Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":"
+									+ "journey_" + p.getLong("journey_id") + ":" + "sec_"
+									+ jounenySection.getString("section_name").replaceAll(" ", "").toLowerCase(),
+							journeyDetails);
+					jedis.sadd("loc_" + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":journey",
+							Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":"
+									+ "journey_" + p.getLong("journey_id") + ":" + "sec_"
+									+ jounenySection.getString("section_name").replaceAll(" ", "").toLowerCase());
+					jedis.sadd("sec_"+jounenySection.getString("section_name").replaceAll(" ", "").toLowerCase()+ ":journey", Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":"
+							+ "journey_" + p.getLong("journey_id") + ":" + "sec_"
+							+ jounenySection.getString("section_name").replaceAll(" ", "").toLowerCase());
+				});
+			} else {
+				Map<String, String> journeyDetails = new HashMap<String, String>();
+				journeyDetails.put("journey_rule_status", p.getString("journey_rule_status"));
+				p.getSet("journey_section_udt", UDTValue.class).forEach(jounenySection -> {
+					jedis.hmset(
+							Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":"
+									+ "journey_" + p.getLong("journey_id") + ":" + "sec_"
+									+ jounenySection.getString("section_name").replaceAll(" ", "").toLowerCase(),
+							journeyDetails);
+					jedis.sadd("sec_"+jounenySection.getString("section_name").replaceAll(" ", "").toLowerCase()+ ":journey", Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":"
+							+ "journey_" + p.getLong("journey_id") + ":" + "sec_"
+							+ jounenySection.getString("section_name").replaceAll(" ", "").toLowerCase());
+					jedis.sadd("loc_" + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":journey",
+							Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":"
+									+ "journey_" + p.getLong("journey_id") + ":" + "sec_"
+									+ jounenySection.getString("section_name").replaceAll(" ", "").toLowerCase());
+				});
+
+			}
+		});
+
+	}
+
+	private void setCountryDetails(Row row, Jedis jedis) {
+		Map<Long, UDTValue> placeDetailsMap = row.getMap("multilocation_types_info", Long.class, UDTValue.class);
+		for (Map.Entry<Long, UDTValue> entryset : placeDetailsMap.entrySet()) {
+			if ("Include".equalsIgnoreCase(entryset.getValue().getString("country_status"))) {
+				/*
+				 * jedis.set( Constants.LOCATION_REDIS_KEYS +
+				 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" +
+				 * entryset.getValue().getString("country").replaceAll(" ", ""),
+				 * entryset.getValue().getString("country_status"));
+				 */
+				jedis.sadd(entryset.getValue().getString("country").replaceAll(" ", ""),
+						Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID));
+				/*
+				 * jedis.set(Constants.TEMP_LOCATION_REDIS_KEYS +
+				 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID),
+				 * entryset.getValue().getString("country").replaceAll(" ",
+				 * ""));
+				 */
+				jedis.hset(Constants.TEMP_LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID),
+						"country", entryset.getValue().getString("COUNTRY").replaceAll(" ", ""));
+			}
+		}
+	}
+
+	private void setCityAndStateDetails(Row row, Jedis jedis) {
+		Map<Long, UDTValue> placeDetailsMap = row.getMap("multilocation_sub_types_info", Long.class, UDTValue.class);
+		for (Map.Entry<Long, UDTValue> entryset : placeDetailsMap.entrySet()) {
+			Map<String, String> cityDetails = new HashMap<String, String>();
+			if (entryset.getValue().getString("city") != null && entryset.getValue().getString("city").length() > 0) {
+				cityDetails.put("radius", String.valueOf(entryset.getValue().getInt("radius")));
+				cityDetails.put("status", entryset.getValue().getString("status"));
+				jedis.hmset(Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":"
+						+ "geo_" + entryset.getKey(), cityDetails);
+				Map<String, GeoCoordinate> geoAdd = new HashMap<String, GeoCoordinate>();
+				geoAdd.put(
+						Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":"
+								+ "geo_" + entryset.getKey(),
+						new GeoCoordinate(entryset.getValue().getDouble("longitude"),
+								entryset.getValue().getDouble("latitude")));
+				jedis.geoadd("latlong", geoAdd);
+
+				/*
+				 * jedis.set(Constants.LOCATION_REDIS_KEYS +
+				 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" +
+				 * entryset.getValue().getString("city"),
+				 * entryset.getValue().getString("status"));
+				 */
+			} else if (entryset.getValue().getString("state") != null
+					&& entryset.getValue().getString("state").length() > 0
+					&& "Include".equalsIgnoreCase(entryset.getValue().getString("status"))) {
+				/*
+				 * jedis.set( Constants.LOCATION_REDIS_KEYS +
+				 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" +
+				 * entryset.getValue().getString("state").replaceAll(" ", ""),
+				 * entryset.getValue().getString("status"));
+				 */
+				jedis.sadd(entryset.getValue().getString("state").replaceAll(" ", ""),
+						Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID));
+				/*
+				 * jedis.set(Constants.TEMP_LOCATION_REDIS_KEYS +
+				 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID),
+				 * entryset.getValue().getString("state").replaceAll(" ", ""));
+				 */
+				jedis.hset(Constants.TEMP_LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID),
+						"STATE", entryset.getValue().getString("state").replaceAll(" ", ""));
+			}
+		}
+	}
+
+	private void setPlaceDetails(Row row, Jedis jedis) {
+		List<UDTValue> vendorList = row.getList("place_info", UDTValue.class);
+		vendorList.stream().forEach(p -> {
+			Set<UDTValue> sections = p.getSet("place_section_udt", UDTValue.class);
+			Map<String, GeoCoordinate> geoAdd = new HashMap<String, GeoCoordinate>();
+			geoAdd.put("place_" + p.getLong("place_id"),
+					new GeoCoordinate(p.getDouble("place_longitude"), p.getDouble("place_latitude")));
+			jedis.geoadd("latlong", geoAdd);
+			Iterator<UDTValue> iterator = sections.iterator();
+			if (!iterator.hasNext()) {
+				if (p.getString("place_type").equalsIgnoreCase("PLACE")) {
+					jedis.sadd("loc_"+row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID)+":place", "place_"+p.getLong("place_id"));
+					jedis.sadd("place_"+p.getLong("place_id")+":loc", Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID));
+					jedis.hset(Constants.TEMP_LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID), "PLACE_ID","place_"+p.getLong("place_id")+":loc");
+				}else{
+					jedis.sadd("loc_"+row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID)+":vendorapp", "vendorapp_"+p.getLong("place_id"));
+					jedis.sadd("vendorapp_"+p.getLong("place_id")+":loc",Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID));
+					jedis.hset(Constants.TEMP_LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID), "VENDORAPP_ID","vendorapp_"+p.getLong("place_id")+":loc");
+				}
+			}
+			while(iterator.hasNext()){
+				UDTValue sectionUdt = iterator.next();
+				if (p.getString("place_type").equalsIgnoreCase("PLACE")) {
+					jedis.sadd("loc_"+row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID)+":place", "place_"+p.getLong("place_id"));
+					jedis.sadd("sec_"+sectionUdt.getString("section_name").replaceAll(" ", "").toLowerCase()+":place_"+p.getLong("place_id")+":loc", Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID));	
+					jedis.hset(Constants.TEMP_LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID), "PLACE_ID","sec_"+sectionUdt.getString("section_name").replaceAll(" ", "").toLowerCase()+":place_"+p.getLong("place_id")+":loc");
+				} else {
+					jedis.sadd("loc_"+row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID)+":vendorapp", "vendorapp_"+p.getLong("place_id"));
+					jedis.sadd("sec_"+sectionUdt.getString("section_name").replaceAll(" ", "").toLowerCase()+":vendorapp_"+p.getLong("place_id")+":loc",Constants.LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID));
+					jedis.hset(Constants.TEMP_LOCATION_REDIS_KEYS + row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID), "VENDORAPP_ID","sec_"+sectionUdt.getString("section_name").replaceAll(" ", "").toLowerCase()+":vendorapp_"+p.getLong("place_id")+":loc");
+				}
+			}
+		});
+
+	}
+
+	/*
+	 * private void setCityAndStateDetails(Row row, Jedis jedis) { Map<Long,
+	 * UDTValue> placeDetailsMap = row.getMap("multilocation_sub_types_info",
+	 * Long.class, UDTValue.class); for (Map.Entry<Long, UDTValue> entryset :
+	 * placeDetailsMap.entrySet()) { Map<String, String> cityDetails = new
+	 * HashMap<String, String>(); if (entryset.getValue().getString("city") !=
+	 * null && entryset.getValue().getString("city").length() > 0) {
+	 * if(entryset.getValue().getString("status").equalsIgnoreCase("Include")){
+	 * cityDetails.put("radius",
+	 * String.valueOf(entryset.getValue().getInt("radius")));
+	 * cityDetails.put("status", entryset.getValue().getString("status"));
+	 * DecimalFormat df2 = new DecimalFormat("0.00");
+	 * df2.setRoundingMode(RoundingMode.DOWN); DecimalFormat df3 = new
+	 * DecimalFormat("0.000"); df3.setRoundingMode(RoundingMode.DOWN); double
+	 * CampaignLongitude = entryset.getValue().getDouble("longitude"); double
+	 * CampaignLatitude = entryset.getValue().getDouble("latitude"); double
+	 * CampaingTrimmedLongitude =
+	 * Double.parseDouble(df2.format(CampaignLongitude)); double
+	 * CampaingTrimmedLatitude =
+	 * Double.parseDouble(df2.format(CampaignLatitude)); int CampaignRadius =
+	 * entryset.getValue().getInt("radius"); for (int x = 0; x <= CampaignRadius
+	 * + 2; x++) { for (int i = -x; i <= x; i++) { for (int j = -x; j <= x; j++)
+	 * { String RangeOfCampaingTrimmedLongitude = df2
+	 * .format(((CampaingTrimmedLongitude * 100 + i) / 100)); String
+	 * RangeOfCampaingTrimmedLatitude = df2.format(((CampaingTrimmedLatitude *
+	 * 100 + j) / 100)); String Key = RangeOfCampaingTrimmedLongitude + ":" +
+	 * RangeOfCampaingTrimmedLatitude; double KeyCentreLongitude = Double
+	 * .parseDouble(df3.format(((CampaingTrimmedLongitude * 1000 + 5) + i * 10)
+	 * / 1000)); double KeyCentreLatitude = Double
+	 * .parseDouble(df3.format(((CampaingTrimmedLatitude * 1000 + 5) + j * 10) /
+	 * 1000)); jedis.geoadd("g_" + Key, CampaignLongitude, CampaignLatitude,
+	 * Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" + "geo_" +
+	 * entryset.getKey()); jedis.geoadd("g_" + Key, KeyCentreLongitude,
+	 * KeyCentreLatitude, "KeyCenter");
+	 * 
+	 * for (int k = 0; k <= CampaignRadius; k++) { String range = Key + ":" + k
+	 * + "-" + (k + 1) + ":km"; jedis.sadd(Key, range); } for (int k = 0; k <=
+	 * CampaignRadius; k++) { if (jedis.geodist("g_" + Key, "KeyCenter",
+	 * Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" + "geo_" +
+	 * entryset.getKey()) < ((k * 1000) + 3000)) { jedis.sadd(Key + ":" + k +
+	 * "-" + (k + 1) + ":km", Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" + "geo_" +
+	 * entryset.getKey()); break; } } jedis.del("g_" + Key); jedis.del(Key); } }
+	 * }
+	 * 
+	 * jedis.hmset(Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" + "geo_" +
+	 * entryset.getKey(), cityDetails); }
+	 * 
+	 * jedis.set(Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" +
+	 * entryset.getValue().getString("city"),
+	 * entryset.getValue().getString("status"));
+	 * 
+	 * } else if (entryset.getValue().getString("state") != null &&
+	 * entryset.getValue().getString("state").length() > 0) { jedis.set(
+	 * Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" +
+	 * entryset.getValue().getString("state").replaceAll(" ", ""),
+	 * entryset.getValue().getString("status")); }
+	 * 
+	 * } }
+	 */
+
+	/*
+	 * private void setPlaceDetails(Row row, Jedis jedis) { Map<String, String>
+	 * placeDetails = new HashMap<String, String>(); List<UDTValue> vendorList =
+	 * row.getList("vendor_info", UDTValue.class); vendorList.stream().forEach(p
+	 * -> { placeDetails.put("radius",
+	 * String.valueOf(p.getInt("vendor_location_radius"))); Set<Long> sections =
+	 * p.getSet("location_sections", Long.class);
+	 * sections.forEach(locationSection -> { if (locationSection != 0) {
+	 * jedis.set(Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" + "sec_" +
+	 * locationSection, ""); } }); DecimalFormat df4 = new
+	 * DecimalFormat("0.0000"); df4.setRoundingMode(RoundingMode.DOWN);
+	 * DecimalFormat df5 = new DecimalFormat("0.00000"); double
+	 * CampaignLongitude = p.getDouble("vendor_location_longitude"); double
+	 * CampaignLatitude = p.getDouble("vendor_location_latitude"); double
+	 * CampaingTrimmedLongitude =
+	 * Double.parseDouble(df4.format(p.getDouble("vendor_location_longitude")));
+	 * double CampaingTrimmedLatitude =
+	 * Double.parseDouble(df4.format(p.getDouble("vendor_location_latitude")));
+	 * int CampaignRadius = p.getInt("vendor_location_radius"); for (int x = 0;
+	 * x <= CampaignRadius + 2; x++) { for (int i = -x; i <= x; i++) { for (int
+	 * j = -x; j <= x; j++) { String RangeOfCampaingTrimmedLongitude = df4
+	 * .format(((CampaingTrimmedLongitude * 10000 + i) / 10000)); String
+	 * RangeOfCampaingTrimmedLatitude = df4 .format(((CampaingTrimmedLatitude *
+	 * 10000 + j) / 10000)); String Key = RangeOfCampaingTrimmedLongitude + ":"
+	 * + RangeOfCampaingTrimmedLatitude; double KeyCentreLongitude = Double
+	 * .parseDouble(df5.format(((CampaingTrimmedLongitude * 100000 + 5) + i *
+	 * 10) / 100000)); double KeyCentreLatitude = Double
+	 * .parseDouble(df5.format(((CampaingTrimmedLatitude * 100000 + 5) + j * 10)
+	 * / 100000)); jedis.geoadd("g_" + Key, CampaignLongitude, CampaignLatitude,
+	 * Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" + "place_" +
+	 * p.getLong("vendor_id")); jedis.geoadd("g_" + Key, KeyCentreLongitude,
+	 * KeyCentreLatitude, "KeyCenter");
+	 * 
+	 * for (int k = 0; k <= CampaignRadius; k++) { String range = Key + ":" + k
+	 * + "-" + (k + 1) + ":m"; jedis.sadd(Key, range); } for (int k = 0; k <=
+	 * CampaignRadius; k++) { if (jedis.geodist("g_" + Key, "KeyCenter",
+	 * Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" + "place_" +
+	 * p.getLong("vendor_id")) < ((k * 1) + 3)) { jedis.sadd(Key + ":" + k + "-"
+	 * + (k + 1) + ":m", Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" + "place_" +
+	 * p.getLong("vendor_id")); break; } } jedis.del("g_" + Key); } } }
+	 * jedis.hmset(Constants.LOCATION_REDIS_KEYS +
+	 * row.getLong(Constants.LOCATION_GROUP_CASSANDRA_ID) + ":" + "place_" +
+	 * p.getLong("vendor_id"), placeDetails); });
+	 * 
+	 * }
+	 */
+
+}

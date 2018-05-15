@@ -1,0 +1,187 @@
+package com.bprise.orbit.migration.handler;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.commons.validator.GenericValidator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Component;
+
+import com.bprise.orbit.migration.exception.MQTTKeyCreationFailedException;
+import com.bprise.orbit.migration.util.Constants;
+import com.bprise.orbit.migration.util.QueryStore;
+import com.bprise.orbit.migration.util.RedisProperties;
+import com.datastax.driver.core.BoundStatement;
+import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
+
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.Pipeline;
+
+@Component
+public class VendorApplicationHandler implements Handler {
+	private static final Logger logger = LoggerFactory.getLogger(VendorApplicationHandler.class);
+	
+	@Autowired
+	private RedisProperties properties;
+	
+@Qualifier("MQTTRedisConnection")
+@Autowired
+Jedis MQTTRedisConnection;
+	
+	@Override
+	public void update(List<Long> ids, Session session, Jedis jedis) {
+		ids.forEach(p -> {
+			jedis.keys("vendorapp_" + p + "*").forEach(t -> {
+				jedis.del(t);
+			});
+			;
+		});
+		PreparedStatement prepared = session.prepare(QueryStore.GET_VENDOR_APPLICATION);
+		
+		
+		BoundStatement bound = prepared.bind(ids);
+		ResultSet rs = session.execute(bound);
+		List<Row> rows = rs.all();
+		//Creating  a list of cassandra output so that we can add the data to pipline
+		List<Row> listOfCassandraOutput= new ArrayList<>();
+		int rowCount=0;
+	
+		for (Row row : rows) {
+			createVendorApplication(row, jedis);
+			++rowCount;
+			listOfCassandraOutput.add(row);
+			if(rowCount%Constants.MQTT_BATCH_INSERTION==0) {
+			createMqttApplication(listOfCassandraOutput,MQTTRedisConnection,properties.getEmqttAuthDatabase());
+			listOfCassandraOutput.clear();
+			}
+		}
+		//inserting a last batch
+		if(listOfCassandraOutput.size()>0) {
+		createMqttApplication(listOfCassandraOutput,MQTTRedisConnection,properties.getEmqttAuthDatabase());
+		listOfCassandraOutput.clear();
+		}
+		
+		
+		
+	
+	}
+
+	
+	private void createMqttApplication(List<Row> listOfCassandraOutput, Jedis jedis, int databaseIndex) {
+		// TODO Auto-generated method stub
+		logger.info("Creating MQTT application in redis index {}",jedis.getDB());
+		Pipeline pipelineDataCredientials= jedis.pipelined();
+		Pipeline pipelineDataACL= jedis.pipelined();
+		
+		
+		logger.info("Redis Index is changing to {} ..", databaseIndex);
+		
+
+	
+	for(Row row:listOfCassandraOutput) {
+		
+		
+		if(!GenericValidator.isBlankOrNull(row.getString("client_id"))
+				&& !GenericValidator.isBlankOrNull(row.getString("mqtt_token"))
+				&& !GenericValidator.isBlankOrNull(row.getString("vendor_uid"))
+				&& !GenericValidator.isBlankOrNull(row.getString("vendor_application_uid"))) {	
+		
+		if(row.getByte("is_deleted") == 0)	{
+			if(row.getString("app_type").trim().equalsIgnoreCase(Constants.MQTT_APP_TYPE) 
+					|| row.getString("app_type").trim()==Constants.MQTT_APP_TYPE) {
+			
+			StringBuilder topicString=new StringBuilder();
+			String venderUid=row.getString("vendor_uid")!=null ? row.getString("vendor_uid") : "";
+			String appUid=row.getString("vendor_application_uid")!=null ? row.getString("vendor_application_uid") : "";
+			
+			/********************************************** INSERTING  AUTH CREDIENTIALS *******************************************/
+			pipelineDataCredientials.hset
+			(Constants.MQTT_REDIS_KEY_AUTH_PREFIX+row.getString("client_id")!=null ? Constants.MQTT_REDIS_KEY_AUTH_PREFIX+row.getString("client_id") : 
+				Constants.MQTT_REDIS_KEY_AUTH_PREFIX+"",
+					Constants.MQTT_TOKEN_STRING,
+					row.getString("mqtt_token")!=null ? row.getString("mqtt_token") : "");
+			logger.info(Constants.MQTT_REDIS_KEY_AUTH_PREFIX+row.getString("client_id")+"::"+Constants.MQTT_TOKEN_STRING
+					+row.getString("mqtt_token"));
+			/****************************************INSERTING ACL CREDENTIALS*******************************************************/
+			
+			
+			/************************************** MAKING VENDER SPECIFIC TOPIC *************************************************************/
+			pipelineDataACL.hset(Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id")!=null ? Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id") : 
+				Constants.MQTT_REDIS_KEY_ACL_PREFIX+"",
+					topicString.append(Constants.MQTT_VENDER_KEYWORD+venderUid).toString(), "1");
+			
+			logger.info(Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id")+"::"+
+					topicString.toString());
+			
+			/********************************** MAKING VENDER+ APP SPECIFIC TOPIC **************************************************************/
+			pipelineDataACL.hset(Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id")!=null ? Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id") : 
+				Constants.MQTT_REDIS_KEY_ACL_PREFIX+"",
+					topicString.append(Constants.MQTT_APP_KEYWORD+appUid).toString(), "1");
+			
+			logger.info(Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id")+"::"+
+					topicString.toString());
+			
+			/********************************** MAKING VENDER+ APP+ DEVICE SPECIFIC TOPIC **************************************************************/
+			pipelineDataACL.hset(Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id")!=null ? Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id") : 
+				Constants.MQTT_REDIS_KEY_ACL_PREFIX+"",
+					topicString.append(Constants.MQTT_DEVICE_KEYWORD).toString(), "1");
+			
+			logger.info(Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id")+"::"+
+					topicString.toString());
+			}// checking app_type is  Mobile App or not
+			else
+				logger.error("id "+ row.getLong("id")+" is not "+Constants.MQTT_APP_TYPE+" type..");
+			}// checking whether it is deleted or not
+			else {
+				jedis.del(Constants.MQTT_REDIS_KEY_AUTH_PREFIX+row.getString("client_id"));
+				jedis.del(Constants.MQTT_REDIS_KEY_ACL_PREFIX+row.getString("client_id"));
+			}// end of if condition whether deleted or not
+		}// checking any of the value is null or not
+		else {
+			logger.error("id "+row.getLong("id")+" is having null fields....");	
+		}// else of checking any of the value is null or not
+	}// end of for loop
+	
+	try {
+	pipelineDataCredientials.sync();
+	pipelineDataACL.sync();
+	}catch(MQTTKeyCreationFailedException e) {
+		e.printStackTrace();
+	}
+
+		
+	
+	}
+
+	private void createVendorApplication(Row row, Jedis jedis) {
+		logger.info("Creating vender application in redis index {}",jedis.getDB());
+		if (row.getByte("is_deleted") == 0) {
+			Map<String, String> vendorAppDetails = new HashMap<String, String>();
+			vendorAppDetails.put("api_key", row.getString("api_key")!= null?row.getString("api_key"):"");
+			vendorAppDetails.put("application_id", row.getString("application_id")!=null? row.getString("application_id"):"");
+			vendorAppDetails.put("name", row.getString("name")!= null?row.getString("name"):"");
+			vendorAppDetails.put("os_name", row.getString("os_name")!= null?row.getString("os_name"):"");
+			vendorAppDetails.put("package_name", row.getString("package_name")!= null?row.getString("package_name"):"");
+			vendorAppDetails.put("vendorId", String.valueOf(row.getLong("vendor_id")));
+			vendorAppDetails.put("appType", row.getString("app_type"));
+			vendorAppDetails.put("isSelfApp", String.valueOf(row.getByte("is_self_app")));
+			jedis.hmset("vendorapp_" + row.getLong("id"), vendorAppDetails);
+			jedis.set("vendorappuid_"+row.getString("vendor_application_uid"),  String.valueOf(row.getLong("id")));
+			jedis.set("map_vendor_"+row.getLong("vendor_id")+":"+"vendorapp_"+row.getLong("id"), "");
+			//jedis.select(properties.getEmqttAuthDatabase());
+		} else {
+			jedis.del("vendorapp_" + row.getLong("id"));
+			jedis.del("map_vendor_"+row.getLong("vendor_id")+":"+"vendorapp_"+row.getLong("id"));
+			jedis.del("vendorappuid_"+row.getString("vendor_application_uid"));
+		}
+	}
+
+}
